@@ -51,9 +51,16 @@ struct SharedArenaHeader {
     uint32_t header_bytes;
     uint64_t arena_bytes;
     uint64_t pack_hash;
-    uint64_t reserved[4];
+    // Windows only (a Linux file leaves them 0): kSharedLoading while one engine writes the experts, kSharedReady
+    // once they are all in; the PID of the engine that loaded them; kSharedLargePages when the section has them.
+    uint64_t state;
+    uint64_t loader_pid;
+    uint64_t flags;
+    uint64_t reserved;
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
+constexpr uint64_t kSharedLoading = 1, kSharedReady = 2;
+constexpr uint64_t kSharedLargePages = 1;
 
 #ifndef _WIN32
 // bytes in free blocks of 2 MiB or more (/proc/buddyinfo, order >= 9): what MADV_HUGEPAGE can get without compaction
@@ -84,37 +91,272 @@ uint64_t free_huge_bytes() {
 }
 #endif
 
+#ifdef _WIN32
+#ifndef FILE_MAP_LARGE_PAGES
+#define FILE_MAP_LARGE_PAGES 0x20000000
+#endif
+
+// MEM_LARGE_PAGES and SEC_LARGE_PAGES need SeLockMemoryPrivilege.  Having it assigned to the account is not enough:
+// the PROCESS must enable it in its own token (AdjustTokenPrivileges) first, or the allocation fails.  True when it
+// is enabled; AdjustTokenPrivileges "succeeds" with ERROR_NOT_ALL_ASSIGNED for an account without the assignment.
+bool enable_lock_memory_privilege() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    bool ok = false;
+    if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        ok = AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(tok);
+    return ok;
+}
+
+std::wstring widen(const std::string& s) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w((size_t) (std::max)(n, 1), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    w.resize(wcslen(w.c_str()));
+    return w;
+}
+
+// --shared-expert-arena NAME on Windows: a named section backed by the page file, shared by every engine of this
+// Windows session that is given the same NAME (Local\NAME; a NAME starting with Local\ or Global\ is used as given).
+// Section = one SharedArenaHeader page + the arena.  The "NAME-lock" mutex is held while a section is opened or
+// created and, by the one engine that writes the experts, until the load is over (PinnedArena::finish_shared):
+//   * no section: this engine creates it (large pages, else 4 KB pages), writes the header "loading" and loads;
+//   * a section whose header says "ready": the experts are in; this engine maps it, does not load, and the lock is
+//     released at once;
+//   * a section left "loading" (its loader ended; the wait returned WAIT_ABANDONED): this engine loads it again.
+// The handles are not inheritable, so a child process cannot keep the section alive; Windows frees it when the last
+// engine closes it (or ends).  The header binds it to one pack, as the Linux file is.
+void* reserve_shared_section(uint64_t bytes, PageBacking& got, std::string& note, const std::string& name_in,
+                             uint64_t pack_hash, void*& mapping_base, uint64_t& mapping_bytes, void*& section,
+                             void*& lock, bool& ready) {
+    if (pack_hash == 0) {
+        note = "shared arena requires a nonzero pack hash";
+        return nullptr;
+    }
+    std::string name = name_in;
+    if (name.rfind("Local\\", 0) != 0 && name.rfind("Global\\", 0) != 0) {
+        for (char& c : name)
+            if (c == '\\' || (unsigned char) c < 32) c = '_';
+        name = "Local\\" + name;
+    }
+    const std::wstring wname = widen(name), wlock = widen(name + "-lock");
+    const SIZE_T large = GetLargePageMinimum();
+    const uint64_t small_bytes = (kSharedArenaHeaderBytes + bytes + 4095) & ~(uint64_t) 4095;
+    const uint64_t large_bytes = large > 0 ? (small_bytes + large - 1) / large * large : 0;
+    auto err = [](const char* what) {
+        return std::string(what) + " (error " + std::to_string((unsigned long long) GetLastError()) + ")";
+    };
+
+    HANDLE m = CreateMutexW(nullptr, FALSE, wlock.c_str());
+    if (m == nullptr) {
+        note = err(("cannot create the shared arena's lock " + name + "-lock").c_str());
+        return nullptr;
+    }
+    bool abandoned = false;
+    for (int waited = 0;; waited += 10) {
+        const DWORD w = WaitForSingleObject(m, 10000);
+        if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+            abandoned = w == WAIT_ABANDONED;
+            break;
+        }
+        if (w != WAIT_TIMEOUT) {
+            note = err(("cannot wait for the shared arena's lock " + name + "-lock").c_str());
+            CloseHandle(m);
+            return nullptr;
+        }
+        unsigned long long pid = 0;
+        if (HANDLE p = OpenFileMappingW(FILE_MAP_READ, FALSE, wname.c_str())) {
+            if (const auto* h = (const SharedArenaHeader*) MapViewOfFile(p, FILE_MAP_READ, 0, 0, sizeof(SharedArenaHeader))) {
+                pid = h->loader_pid;
+                UnmapViewOfFile(h);
+            }
+            CloseHandle(p);
+        }
+        std::fprintf(stderr, "strata generate: shared expert arena %s: waiting %d s for engine PID %llu to load it\n",
+                     name.c_str(), waited + 10, pid);
+    }
+    auto fail = [&](const std::string& why, HANDLE s, void* v) {
+        if (v != nullptr) UnmapViewOfFile(v);
+        if (s != nullptr) CloseHandle(s);
+        ReleaseMutex(m);
+        CloseHandle(m);
+        note = why;
+        return nullptr;
+    };
+
+    const unsigned long long self = (unsigned long long) GetCurrentProcessId();
+    HANDLE s = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, wname.c_str());
+    if (s != nullptr) {
+        // Read-only first. An engine that finds the experts already loaded never writes them, and a large-page
+        // view cannot be made read-only afterwards (VirtualProtect fails with 487). The page size is not known
+        // until the map: try a large-page view first (it needs FILE_MAP_LARGE_PAGES and the rounded size).
+        bool lp = false;
+        void* v = large_bytes > 0 ? MapViewOfFile(s, FILE_MAP_READ | FILE_MAP_LARGE_PAGES, 0, 0, (SIZE_T) large_bytes)
+                                  : nullptr;
+        lp = v != nullptr;
+        if (v == nullptr) v = MapViewOfFile(s, FILE_MAP_READ, 0, 0, (SIZE_T) small_bytes);
+        if (v == nullptr)
+            return fail(err(("shared arena " + name + " exists but cannot be mapped at " +
+                             std::to_string((unsigned long long) small_bytes) +
+                             " B: it was made for another pack or size; stop the engines using it, or use another name").c_str()),
+                        s, nullptr);
+        auto* h = (SharedArenaHeader*) v;
+        if (std::memcmp(h->magic, kSharedArenaMagic, sizeof h->magic) != 0 || h->version != 1 ||
+            h->header_bytes != kSharedArenaHeaderBytes || h->arena_bytes != bytes ||
+            ((h->flags & kSharedLargePages) != 0) != lp)
+            return fail("shared arena " + name + " has an incompatible or missing header", s, v);
+        if (h->pack_hash != pack_hash) {
+            char b[320];
+            std::snprintf(b, sizeof b, "shared arena %s was written for pack hash %016llx, expected %016llx: stop the "
+                          "engines using it, or use another name", name.c_str(), (unsigned long long) h->pack_hash,
+                          (unsigned long long) pack_hash);
+            return fail(b, s, v);
+        }
+        mapping_base = v;
+        mapping_bytes = lp ? large_bytes : small_bytes;
+        section = s;
+        got = lp ? PageBacking::LargePages : PageBacking::NormalPages;
+        const char* pages = lp ? "large pages" : "4 KB pages";
+        if (h->state == kSharedReady) {
+            ready = true;
+            note = "opened shared section " + name + " (" + pages + "), loaded by engine PID " +
+                   std::to_string((unsigned long long) h->loader_pid) + ": not loaded again, read-only";
+            ReleaseMutex(m);
+            CloseHandle(m);
+        } else {
+            note = "opened shared section " + name + " (" + pages + ") left unfinished by engine PID " +
+                   std::to_string((unsigned long long) h->loader_pid) + (abandoned ? ", which ended" : "") +
+                   ": this engine loads it";
+            UnmapViewOfFile(v);   // this engine writes the experts: a writable view, of the same page size
+            v = lp ? MapViewOfFile(s, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_LARGE_PAGES, 0, 0, (SIZE_T) large_bytes)
+                   : MapViewOfFile(s, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, (SIZE_T) small_bytes);
+            if (v == nullptr) {
+                mapping_base = nullptr;
+                section = nullptr;
+                return fail(err(("shared arena " + name + " cannot be mapped writable to load it").c_str()), s, nullptr);
+            }
+            mapping_base = v;
+            h = (SharedArenaHeader*) v;
+            h->state = kSharedLoading;
+            h->loader_pid = self;
+            lock = m;
+        }
+        return (uint8_t*) v + kSharedArenaHeaderBytes;
+    }
+    if (GetLastError() != ERROR_FILE_NOT_FOUND)
+        return fail(err(("cannot open shared arena " + name).c_str()), nullptr, nullptr);
+
+    // the first engine: the section is created here.  SEC_COMMIT charges the whole size against the commit limit
+    // (RAM + page file) once, for every engine that maps it.
+    std::string why_small;
+    bool lp = false;
+    void* v = nullptr;
+    if (large_bytes > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
+        const bool priv = enable_lock_memory_privilege();
+        s = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES,
+                               (DWORD) (large_bytes >> 32), (DWORD) large_bytes, wname.c_str());
+        if (s != nullptr) {
+            v = MapViewOfFile(s, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_LARGE_PAGES, 0, 0, (SIZE_T) large_bytes);
+            if (v == nullptr) {
+                why_small = err("large-page section mapped no view");
+                CloseHandle(s);
+                s = nullptr;
+            }
+        } else {
+            // 1450 (ERROR_NO_SYSTEM_RESOURCES): not that many free 2 MiB pages now (RAM fragmented since the boot);
+            // 1314: the privilege; 1455: the commit limit
+            why_small = err(("large-page section refused" + std::string(priv ? "" : ", SeLockMemoryPrivilege not enabled")).c_str());
+        }
+        lp = v != nullptr;
+    } else {
+        why_small = large_bytes > 0 ? "large pages skipped (STRATA_NO_LARGEPAGES)" : "this system has no large-page minimum";
+    }
+    if (v == nullptr) {
+        s = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                               (DWORD) (small_bytes >> 32), (DWORD) small_bytes, wname.c_str());
+        if (s == nullptr) return fail(err(("cannot create shared arena " + name + " of " +
+                                           std::to_string((unsigned long long) small_bytes) + " B").c_str()), nullptr, nullptr);
+        v = MapViewOfFile(s, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, (SIZE_T) small_bytes);
+        if (v == nullptr) return fail(err(("cannot map shared arena " + name).c_str()), s, nullptr);
+    }
+    SharedArenaHeader hdr{};
+    std::memcpy(hdr.magic, kSharedArenaMagic, sizeof hdr.magic);
+    hdr.version = 1;
+    hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
+    hdr.arena_bytes = bytes;
+    hdr.pack_hash = pack_hash;
+    hdr.state = kSharedLoading;
+    hdr.loader_pid = self;
+    hdr.flags = lp ? kSharedLargePages : 0;
+    std::memcpy(v, &hdr, sizeof hdr);
+    mapping_base = v;
+    mapping_bytes = lp ? large_bytes : small_bytes;
+    section = s;
+    lock = m;
+    got = lp ? PageBacking::LargePages : PageBacking::NormalPages;
+    note = "created shared section " + name + " (" + std::to_string(mapping_bytes >> 20) + " MiB, " +
+           (lp ? "large pages (" + std::to_string((unsigned long long) large) + " B)"
+               : "4 KB pages: " + why_small) + "): this engine loads it";
+    return (uint8_t*) v + kSharedArenaHeaderBytes;
+}
+
+void release_shared(void* view, void*& section, void*& lock);
+
+// reserve_shared_early: the section reserved before the rest of the start, kept here for the arena that asks for the same
+// NAME, size and pack.  On the thread that reserved it: the lock it may hold belongs to that thread.
+struct EarlySection {
+    std::string name;
+    uint64_t bytes = 0, pack_hash = 0;
+    void* p = nullptr;
+    PageBacking got = PageBacking::NormalPages;
+    std::string note;
+    void* mapping_base = nullptr;
+    uint64_t mapping_bytes = 0;
+    void* section = nullptr;
+    void* lock = nullptr;
+    bool ready = false;
+};
+EarlySection g_early;
+#endif
+
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
+// On Windows shared_file is the NAME of a page-file-backed section (reserve_shared_section).
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes, void*& shared_section,
+              void*& shared_lock, bool& shared_ready) {
     mapping_base = nullptr;
     mapping_bytes = 0;
 
 #ifdef _WIN32
-    if (!shared_file.empty()) {
-        note = "shared-file arena backing is not implemented on Windows";
-        return nullptr;
-    }
-    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege.  Having it assigned to the account is not enough: the
-    // PROCESS must enable it in its own token (AdjustTokenPrivileges) before VirtualAlloc, or the call fails.
-    // An account without the assignment, or a failure to enable, leaves the process as it was: VirtualAlloc
-    // then refuses and the 4 KB fallback below runs - that is the EXPECTED outcome on a desktop.
-    {
-        HANDLE tok = nullptr;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
-            TOKEN_PRIVILEGES tp{};
-            tp.PrivilegeCount = 1;
-            if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
-                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                if (!AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() != ERROR_NOT_ALL_ASSIGNED)
-                    (void) 0;   // nothing actionable: the large-page attempt below reports the outcome
-            }
-            CloseHandle(tok);
+    if (!shared_file.empty() && g_early.p != nullptr) {
+        EarlySection e = std::move(g_early);
+        g_early = EarlySection{};
+        if (e.name == shared_file && e.bytes == bytes && e.pack_hash == shared_pack_hash) {
+            got = e.got;
+            note = e.note + " (reserved early in the start)";
+            mapping_base = e.mapping_base;
+            mapping_bytes = e.mapping_bytes;
+            shared_section = e.section;
+            shared_lock = e.lock;
+            shared_ready = e.ready;
+            return e.p;
         }
+        release_shared(e.mapping_base, e.section, e.lock);   // reserved for another size: the usual path below
     }
+    if (!shared_file.empty())
+        return reserve_shared_section(bytes, got, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
+                                      shared_section, shared_lock, shared_ready);
+    // An account without SeLockMemoryPrivilege, or a failure to enable it, leaves the process as it was:
+    // VirtualAlloc then refuses and the 4 KB fallback below runs - that is the EXPECTED outcome on a desktop.
+    (void) enable_lock_memory_privilege();   // nothing actionable: the large-page attempt below reports the outcome
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
     // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
     SIZE_T large = GetLargePageMinimum();
@@ -145,6 +387,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     got = PageBacking::NormalPages;
     return p;
 #else
+    (void) shared_section; (void) shared_lock; (void) shared_ready;
     if (!shared_file.empty()) {
         if (shared_pack_hash == 0) {
             note = "shared arena requires a nonzero pack hash";
@@ -327,7 +570,44 @@ void release(void* p, uint64_t bytes) {
 #endif
 }
 
+// The Windows shared section: this engine's view and handle (Windows frees the section with the last one) and, when the
+// load did not finish, the lock, so the next engine is let in to load it.
+void release_shared(void* view, void*& section, void*& lock) {
+#ifdef _WIN32
+    if (view != nullptr) UnmapViewOfFile(view);
+    if (section != nullptr) CloseHandle((HANDLE) section);
+    if (lock != nullptr) {
+        ReleaseMutex((HANDLE) lock);   // fails off the thread that took it: the lock is then freed when that thread ends
+        CloseHandle((HANDLE) lock);
+    }
+#else
+    (void) view;
+#endif
+    section = nullptr;
+    lock = nullptr;
+}
+
 }  // namespace
+
+bool reserve_shared_early(const std::string& name, uint64_t bytes, uint64_t pack_hash, std::string& note) {
+#ifdef _WIN32
+    if (name.empty() || bytes == 0 || g_early.p != nullptr) return false;
+    EarlySection e;
+    e.p = reserve_shared_section(bytes, e.got, e.note, name, pack_hash, e.mapping_base, e.mapping_bytes, e.section,
+                                 e.lock, e.ready);
+    note = e.note;
+    if (e.p == nullptr) return false;
+    e.name = name;
+    e.bytes = bytes;
+    e.pack_hash = pack_hash;
+    g_early = std::move(e);
+    return true;
+#else
+    (void) name; (void) bytes; (void) pack_hash;
+    note = "only on Windows";
+    return false;
+#endif
+}
 
 uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
     uint64_t h = seed;
@@ -340,6 +620,11 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 
 namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
+// the view of an engine that opened a ready Windows shared section is read-only, and CUDA registers read-only pages
+// only with cudaHostRegisterReadOnly
+unsigned register_flags(bool read_only) {
+    return cudaHostRegisterPortable | cudaHostRegisterMapped | (read_only ? (unsigned) cudaHostRegisterReadOnly : 0u);
+}
 }  // namespace
 
 int arena_pin_cap_gib() {
@@ -401,7 +686,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, shared_section,
+                   shared_lock, shared_ready);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -420,7 +706,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
         const cudaError_t e = capped ? cudaSuccess :
-            cudaHostRegister(base, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
+            cudaHostRegister(base, (size_t) bytes, register_flags(shared_ready));
         if (!capped && e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
@@ -440,7 +726,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                if (cudaHostRegister((uint8_t*) base + off, (size_t) n, register_flags(shared_ready)) != cudaSuccess) {
                     (void) cudaGetLastError();
                     break;
                 }
@@ -504,7 +790,8 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
                          uint64_t shared_pack_hash) : capacity(bytes) {
     by_need = true;
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, shared_section,
+                   shared_lock, shared_ready);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -546,7 +833,7 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
         if (it != done.end() && it->first < b) b = it->first;
         if (a >= b) continue;
         if (cap > 0 && total + (b - a) > cap) { capped = true; break; }
-        if (cudaHostRegister((uint8_t*) base + a, (size_t) (b - a), cudaHostRegisterPortable | cudaHostRegisterMapped) !=
+        if (cudaHostRegister((uint8_t*) base + a, (size_t) (b - a), register_flags(shared_ready)) !=
             cudaSuccess) {
             (void) cudaGetLastError();
             refused = 1;
@@ -589,7 +876,8 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
     : capacity(bytes), bounds_(bounds) {
     if (bytes == 0 || bounds.size() < 2) return;
-    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes, shared_section, shared_lock,
+                   shared_ready);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -632,7 +920,8 @@ PinnedArena::~PinnedArena() {
     if (base && by_need) {
         for (const auto& r : locked_ranges) strata::platform::unlock_resident((uint8_t*) base + r.first, r.second);
         for (const auto& r : pin_ranges) cudaHostUnregister((uint8_t*) base + r.first);
-        release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
+        if (shared_section != nullptr) release_shared(mapping_base, shared_section, shared_lock);
+        else release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
         mapping_base = nullptr;
         mapping_bytes = 0;
@@ -645,11 +934,43 @@ PinnedArena::~PinnedArena() {
         } else {
             cudaHostUnregister(base);
         }
-        release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
+        if (shared_section != nullptr) release_shared(mapping_base, shared_section, shared_lock);
+        else release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
         mapping_base = nullptr;
         mapping_bytes = 0;
     }
+}
+
+void PinnedArena::finish_shared(bool loaded) {
+#ifdef _WIN32
+    if (shared_section == nullptr || mapping_base == nullptr) return;
+    if (shared_lock != nullptr) {   // this engine loaded it: say so before the next engine is let in
+        if (loaded) ((SharedArenaHeader*) mapping_base)->state = kSharedReady;
+        ReleaseMutex((HANDLE) shared_lock);
+        CloseHandle((HANDLE) shared_lock);
+        shared_lock = nullptr;
+    }
+    if (!loaded && !shared_ready) return;
+    if (shared_ready) {   // mapped read-only when it was opened (reserve_shared_section)
+        note += "; the shared section is read-only in this engine";
+        return;
+    }
+    if (backing == PageBacking::LargePages) {
+        note += "; the shared section stays writable in this engine, which loaded it (Windows does not change the "
+                "protection of a large-page view); the engines that open it map it read-only";
+        return;
+    }
+    // nothing writes the experts from here on, in any engine: a stray write faults here instead of changing them
+    // under the others (the GPU's mapped alias reads through the registration, which a protection change keeps)
+    DWORD old = 0;
+    note += VirtualProtect(mapping_base, (SIZE_T) mapping_bytes, PAGE_READONLY, &old)
+                ? "; the shared section is read-only in this engine"
+                : "; the shared section could NOT be made read-only (VirtualProtect error " +
+                      std::to_string((unsigned long long) GetLastError()) + ")";
+#else
+    (void) loaded;
+#endif
 }
 
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,

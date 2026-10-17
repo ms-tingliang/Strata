@@ -4217,6 +4217,26 @@ bool shared_arena_pack_hash(const std::string& pack_dir, const std::string& expe
 
 }  // namespace
 
+bool reserve_shared_arena_early(const std::string& pack_dir, const std::string& gguf, int64_t n_layers,
+                                int64_t n_expert, bool pin_by_need, const std::string& name, std::string& note) {
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (name.empty() || lay.n_layers != n_layers || lay.n_expert != n_expert || lay.total == 0) {
+        note = "the expert layout is not loaded yet";
+        return false;
+    }
+    uint64_t pack_hash = 0;
+    if (!shared_arena_pack_hash(pack_dir, pack_dir + "/experts.bin", gguf, lay, pack_hash, note)) return false;
+    // ArenaExpertSource::open's size: pin by need's padded layout (a blob stride of whole pages) or the packed one,
+    // and one spare blob
+    uint64_t arena = lay.total;
+    if (pin_by_need) {
+        arena = 0;
+        for (int64_t l = 0; l < n_layers; ++l)
+            arena += ((lay.blob_bytes(l) + 4095) & ~(uint64_t) 4095) * (uint64_t) n_expert;
+    }
+    return reserve_shared_early(name, arena + lay.max_blob, pack_hash, note);
+}
+
 namespace {
 /// The GGUF file that holds role `r` (0 gate, 1 up, 2 down) of layer `l`: a name beside the --native shard
 /// (native_experts.txt v3 per layer, v4 per role), or the --native shard itself.
@@ -4598,7 +4618,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // writes experts.bin from the arena).  The file offsets (loff) stay packed; only the destination moves.
     padded_ = false;
     pad_ = PadMap{};
-    if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty()) {   // (a shared arena file has one layout for every process: the packed one)
+    // (a Linux shared arena file has one layout for every process: the packed one.  A Windows shared section may be
+    // padded: the layout depends on the blob sizes alone, and an engine whose layout differs is refused by the section's
+    // arena size; each engine then registers the ranges its own GPU needs)
+#ifdef _WIN32
+    const bool shared_packed_only = false;
+#else
+    const bool shared_packed_only = !shared_arena_file.empty();
+#endif
+    if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && !shared_packed_only) {
         padded_ = true;
         uint64_t at = 0;
         for (int64_t l = 0; l < n_layers; ++l) {
@@ -4681,12 +4709,17 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         files.push_back(path);
     }
     std::string why;
-    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
+    // Windows shared section: another engine loaded the experts into it - nothing to read, and this engine must not write
+    const bool shared_ready = a->shared_ready;
+    const bool unbuffered = !shared_ready && experts_unbuffered(files, want + (uint64_t) blob, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
     std::atomic<int> ready{0};
     std::thread reg;
-    if (deferred) {
+    if (shared_ready) {
+        st.bytes = want;
+        st.layers = (uint64_t) n_layers;
+    } else if (deferred) {
         int dev = 0;
         cudaGetDevice(&dev);
         reg = std::thread([a, &ready, dev] {
@@ -4695,7 +4728,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
-    if (from_gguf) {
+    if (shared_ready) {
+        // (loaded by the engine named in the arena's note)
+    } else if (from_gguf) {
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr);
     } else {
         if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
@@ -4703,8 +4738,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr);
     }
     if (reg.joinable()) reg.join();
-    std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
-                 why.c_str());
+    if (shared_ready)
+        std::fprintf(stderr, "strata generate: expert arena not read: another engine loaded it into the shared section\n");
+    else
+        std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
+                     why.c_str());
     if (!st.ok) {
         delete a;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
@@ -4743,6 +4781,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
+    a->finish_shared(true);   // a shared section: the experts are in; the next engine is let in (a failure above: delete a)
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;

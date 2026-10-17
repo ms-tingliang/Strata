@@ -351,3 +351,139 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+## One server per card, with one copy of the experts in RAM (`--shared-expert-arena`, opt-in)
+
+Without a layer split, each card can run its own server on its own port, for example `serve\server.py --gpu 0 --port
+8086`, then `--gpu 1 --port 8087`, and so on. Each engine then keeps its own copy of the experts in RAM: about 47 GiB
+for Flash-Next IQ3_S. Three engines need about three times that, which does not fit in 80 GB of RAM. With
+`--shared-expert-arena NAME`, or `STRATA_SHARED_EXPERT_ARENA=NAME` in the environment or in the config's `"env"`, the
+engines that are given the same NAME share one copy:
+
+- **Windows:** the copy is a named section backed by the page file (`Local\NAME`). **Linux:** it is a file, which
+  should be on `/dev/shm`.
+- The first engine creates the section and reads the experts into it. Engines that start while it loads wait and say
+  so (`waiting 10 s for engine PID 14080 to load it`). Engines that start later open the section and do not read the
+  experts again (`opened shared section Local\NAME ...: not loaded again, read-only`). A named lock (`Local\NAME-lock`)
+  makes sure that only one engine ever writes.
+- Once the experts are in, no engine writes to the section, so it needs no lock while the engines answer. The
+  engines that open it map it read-only (`the shared section is read-only in this engine`). The engine that loaded
+  it makes its view read-only too, except with large pages: Windows does not change the protection of a large-page
+  view (`VirtualProtect` error 487), so that one view stays writable and the engine says so.
+- Any engine can stop and start again on its own. Windows frees the section when the last engine using it ends,
+  whether it was stopped or killed. If the engine that is loading dies, the next engine to start (or the next one
+  waiting) loads the experts again.
+- The section records which pack it holds. An engine with a different pack is refused with a message, and does not
+  use the wrong experts.
+- The KV cache is not shared. Each conversation's KV, in VRAM and in RAM, belongs to its own engine and changes on
+  every token.
+
+To see whether a section still exists (Windows, no extra tools needed):
+
+```
+python tools/shared_arena_status.py NAME
+```
+
+It prints `no such section - freed` (exit code 0), or the section's state, the PID of the engine that loaded it and
+its size (exit code 1).
+
+### Settings it needs on Windows
+
+- `STRATA_ARENA_PIN_GIB=12` (a cap per engine). CUDA counts the RAM it pins for a GPU per process, even when the
+  processes share the pages. With no cap, the first engine pinned 43 GiB and the other engines' pinning was then
+  refused ("the embedding buffer failed").
+- `STRATA_PIN_BY_NEED=1`. Each engine pins only its own card's hot experts. Pinning the whole section in slices
+  filled the cards' shared memory and the engines' later VRAM allocations failed.
+- Large pages: the engine asks for a large-page section first (`SEC_LARGE_PAGES`). Those pages are resident, so no
+  engine locks them afterwards (`large pages are resident without a lock`), and an engine that only reads the experts
+  maps the view read-only. Windows does not change the protection of a large-page view (`VirtualProtect` error 487),
+  so the engine that loaded the experts keeps a writable view and says so; it does not write after the load. The
+  engines that open the section register it with CUDA as read-only. When Windows refuses the section the engine uses
+  4 KB pages and says why. Error 1450 (`ERROR_NO_SYSTEM_RESOURCES`) means not enough free 2 MiB pages at that moment,
+  which is not a missing privilege and not the "available" memory counter: on the PC below a 47 GiB section was
+  refused while 73 GiB still showed as available, and the same PC granted one of 54 GiB a minute later with nothing
+  else running (55 GiB was refused). `STRATA_NO_LARGEPAGES=1` skips the attempt.
+- When the section is reserved: on Windows it is created as soon as the expert layout and the profile are known,
+  before the KV cache and the draft head are allocated. `STRATA_SHARED_ARENA_EARLY=0` leaves that until the arena is
+  created. The log adds `(reserved early in the start)`. Reserving earlier did not avoid error 1450 in the test
+  below.
+- The lock in RAM, 4 KB pages: on the PC below, every engine that opened the section printed
+  `SetProcessWorkingSetSizeEx(36292 MiB) failed (error 1450)`. Windows let the engine that loaded the experts lock
+  them in RAM, and the other engines use the same pages. The engine that loaded the experts again after the loader
+  was killed printed the same error, so from then on nothing held the experts locked. They stayed correct (the same
+  checksum), but Windows may move unlocked pages to the page file when RAM runs short; that was not measured. With
+  4 KB pages the loader does make its view read-only after the load (`VirtualProtect`), and so does every engine
+  that opens it.
+- A config, and so a log, per server: copy the model's `strata-*.json` once per card under another name (for
+  example `run3-8086.json`, with its own `"gpu"` and `"log"`) and start each server with `--config` on its copy. Three
+  servers on one config append to one log, and on Windows their lines overwrite each other's; a server whose engine
+  stops then reads the other engines' lines as its own. Copies whose names do not start with `strata-` are not taken
+  for an installed model by setup.
+
+### Measured (2026-10-17, 3× Titan V 12 GB, 80 GB RAM, 64 GB page file, Windows, Flash-Next IQ3_S, CUDA 12 engine)
+
+- **All three cards serving:** three servers on 8086 to 8088 with `STRATA_SHARED_EXPERT_ARENA=strata-iq3_s`, the
+  settings above, `--gpu 0/1/2`. Without the option, each engine committed 63.3 GiB (three need about 190 GiB, more than
+  the 144 GiB of RAM plus page file). With it, all three served together: 114.4 of 143.9 GiB committed, 7.7 GiB of
+  RAM free.
+- **Start times, 4 KB pages** (large pages refused, error 1450): the engine that loaded the experts was ready in
+  163 to 172 s. The engines that waited for it were ready in 254 to 262 s (about 145 s of waiting, then their own
+  start). Started after the load, an engine was ready in 118 s without reading the experts. The same shape again,
+  later the same day, with the read-only mapping below: the loader in 167 s, the two that waited in 255 s.
+- **Start times, large pages** (the read-only mapping and the early reservation, same PC and model, three starts):
+  the loader was ready in 136 to 140 s and the two that waited in 194 to 202 s. A reader stopped and started again,
+  while the other two kept the section, was ready in 75 s. One engine with no NAME, so its own copy, also got large
+  pages and was ready in 136 s. All of these, and the 4 KB run above, printed checksum `f39b005cfbdcb6e4`.
+- **Large pages are not granted every time.** Three trials with `STRATA_SHARED_ARENA_EARLY=0` and three with it left
+  on, each straight after three engines on 4 KB pages had stopped (73.2 to 73.4 GiB still reported available): large
+  pages in 0 of 3 either way, `large-page section refused (error 1450)`, loader ready in 167 to 172 s. With nothing
+  running, a separate program making the same call then got a 47 GiB large-page section in 1.9 s, and 54 GiB was the
+  largest that worked.
+- **The same experts in every engine:** with `STRATA_VERIFY_ARENA=1`, the loader, both engines that opened the
+  section and an engine with its own private copy all printed `expert arena checksum f39b005cfbdcb6e4 (46.84 GiB)`.
+- **Speed, one engine alone** (200 tokens of a short greedy prompt, three requests): 31.9, 34.6 and 37.2 tok/s with its
+  own copy, and 31.5, 35.3 and 36.3 tok/s with the shared section.
+- **Speed, all three answering at once** (the same prompt): 6.6, 6.6 and 7.3 tok/s. The three engines share the CPU
+  for the experts that are not on a card. One after another, each ran at 27.6 to 34.0 tok/s.
+- **Restart and relaunch:** the server that had loaded the section was stopped and started again while the other two
+  kept answering, and the new engine opened the section. All three were then stopped with Ctrl+C, and again later
+  with `taskkill /F`. Both times `tools/shared_arena_status.py` printed `freed` and three new servers started (one
+  load, two opens) without a reboot.
+- **The loader killed while loading:** two servers were started, and the loading engine and its server were killed 39 s
+  into the load. The waiting engine said `left unfinished by engine PID 6472, which ended: this engine loads it`,
+  loaded the experts (the same checksum) and served at 192 s. Later the same day, on a large-page section, the
+  waiting engine took the section over the same way, printed the same checksum and answered, ready 121 s after it
+  had started.
+- **`tools/strata_bench.py`, the same day and build** (suite 1, three runs per test, medians). The three servers were
+  measured at once, each with `--url`; the other two were run alone:
+
+  | | 3 servers at once, shared (each / sum) | 1 server, GPU 0 | 1 server, layer split 16,44 on 3 cards |
+  |---|---|---|---|
+  | Chat decode, tok/s | 6.2-7.4 / 20.1 | 24.7 | 36.2 |
+  | Chat first token, s | 5.7-6.3 | 1.35 | 0.95 |
+  | 4K prompt, tok/s | 239-244 / 727 | 850 | 466 |
+  | 16K prompt, tok/s | 263-323 / 849 | 868 | 848 |
+  | Agent cache hit | 68.6-68.8% | 68.6% | 68.8% |
+
+  The three servers together are slower than one: they share the CPU, the RAM's bandwidth and the PCIe links for the
+  experts that are not on a card. What they give is three conversations at once, each with its own context, without
+  three copies of the experts. For one conversation at a time, the layer split is faster.
+
+Identical requests sent to different engines at the same time gave identical answers. Sent one after another, the
+answers sometimes parted after a few lines. The same engine does this from one request to the next (its expert cache
+moves experts between the card and the CPU), and the checksums above show the experts were the same.
+
+The Linux file path with this model, same PC, WSL2 Ubuntu with its memory set to 64 GB (it reports 62 GiB). `/dev/shm`
+has to be raised too: at the default, half of RAM (31 GiB), the 47 GiB file was mapped and the engine died with
+SIGBUS. With `/dev/shm` at 52 GB, one engine on GPU 0, context 8192, file `/dev/shm/strata-iq3_s`: ready in 373 s
+(the pack was read through the Windows drive), checksum `8ae1446c68dc969b` (46.84 GiB), and the same prompt as the
+Windows runs answered `Jupiter / Saturn / Uranus`. A second engine on GPU 1 mapped that file and printed the same
+checksum; it read the experts again, because a Linux file does not record that a load has finished, which is what
+lets a Windows engine skip the read. The checksum is not the Windows one: a Linux shared file stays packed, and the
+Windows section uses pin by need's padded layout. `platform_memory_test` still fails for the normal user (`mlock`
+is limited to 64 MiB) and passes as root (`locked=256 MiB`); the larger VM does not raise that limit.
+
+Not tested: the HIP build (no ROCm on this PC; the Windows code was compiled with clang instead, and the read-only
+registration uses the HIP flag the shim already maps, which was not built here), macOS, and the SYCL port (its files
+are not touched, and it keeps its own shared-arena code). A launcher that runs setup three times at once races on
+the shared config file; set up (and tune) once, then start the servers as above.

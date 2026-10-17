@@ -51,6 +51,8 @@ struct PinnedArena {
     /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
     /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
     /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
+    /// On Windows `shared_file` is a NAME: a page-file-backed section shared by the engines given the same name, one of
+    /// which loads it while the others wait (`shared_ready`, finish_shared); Windows frees it with the last engine.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
                 const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
     /// Pin by need (STRATA_PIN_BY_NEED=1): register only the given byte ranges (offset, length), in the given order
@@ -77,6 +79,16 @@ struct PinnedArena {
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
+    /// Windows shared section (`shared_file`): its handle, and its "NAME-lock" mutex while this engine is the one that
+    /// loads the experts (held by the thread that built the arena, until finish_shared).
+    void* shared_section = nullptr;
+    void* shared_lock = nullptr;
+    /// Windows shared section: another engine loaded the experts already - do not load, do not write the arena.
+    bool shared_ready = false;
+    /// Windows shared section, on the thread that built the arena: `loaded` true marks the experts as in (when this
+    /// engine loaded them) and makes this engine's view read-only; the lock is released either way, so after a failed
+    /// load the next engine loads.  Nothing without a shared section, and off Windows.
+    void finish_shared(bool loaded);
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
@@ -84,6 +96,13 @@ struct PinnedArena {
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
 };
+
+/// Windows, --shared-expert-arena NAME: create (or open, or wait for) the shared section of `bytes` for the pack
+/// `pack_hash` now, before the rest of the start allocates, and keep it for the PinnedArena that asks for the same NAME,
+/// size and pack (a different one releases it and takes the usual path).  A large-page section needs that many free
+/// 2 MiB pages at once.  Call it on the thread that builds the arena.  False (with the reason in `note`) when nothing
+/// was reserved; off Windows always false.
+bool reserve_shared_early(const std::string& name, uint64_t bytes, uint64_t pack_hash, std::string& note);
 
 struct LoadStats {
     double seconds = 0.0;

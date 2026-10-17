@@ -448,7 +448,7 @@ struct Options {
     bool no_host_worker = false;
     bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
-    std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
+    std::string shared_expert_arena; ///< optional backing for the resident arena shared by processes (Linux: a file, Windows: a section name)
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
@@ -931,6 +931,10 @@ void usage() {
                  "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same pack.\n"
+                 "                       Windows: FILE is a NAME - one page-file-backed section for every engine\n"
+                 "                       of this session given that NAME: the first loads the experts, the others\n"
+                 "                       wait and map them read-only; freed when the last engine exits.\n"
+                 "                       STRATA_SHARED_EXPERT_ARENA=FILE does the same without the option.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
@@ -2406,6 +2410,14 @@ int main(int argc, char** argv) {
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+    if (const char* v = std::getenv("STRATA_SHARED_EXPERT_ARENA");
+        o.shared_expert_arena.empty() && v != nullptr && v[0] != '\0') {
+        if (o.mmap_experts)
+            std::fprintf(stderr, "strata generate: STRATA_SHARED_EXPERT_ARENA is not used with --mmap-experts (there is no "
+                                 "resident arena to share)\n");
+        else
+            o.shared_expert_arena = v;
+    }
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -3701,6 +3713,24 @@ int main(int argc, char** argv) {
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
     if (!o.expert_profile_save.empty()) profile_loaded = profile;
+#ifdef _WIN32
+    // --shared-expert-arena on Windows: the section now, before the KV buffers, the drafter and the head take RAM.
+    // A large-page section needs ~47 GiB of free 2 MiB pages at once; asked for after them, Windows refused it with
+    // error 1450 on an 80 GB PC that granted it before the engine started.  The arena below takes it over when
+    // its size matches (the pin-by-need test is the one below); STRATA_SHARED_ARENA_EARLY=0 leaves it to the arena.
+    if (const char* early = std::getenv("STRATA_SHARED_ARENA_EARLY");
+        !o.mmap_experts && !o.shared_expert_arena.empty() && (early == nullptr || early[0] != '0')) {
+        const char* pn = std::getenv("STRATA_PIN_BY_NEED");
+        const bool by_need = pn != nullptr && pn[0] != '\0' && pn[0] != '0' && !profile.empty() && !multi_gpu &&
+                             o.peer_device < 1 &&
+                             std::none_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+                                          [](int n) { return n > 0; });
+        std::string why;
+        if (!strata::core::reserve_shared_arena_early(o.pack, o.native_preset, g.n_layers, g.n_expert, by_need,
+                                                      o.shared_expert_arena, why))
+            std::fprintf(stderr, "strata generate: shared expert arena not reserved early (%s)\n", why.c_str());
+    }
+#endif
     // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window, measured on
     // the 5080 + 3090 rig (bench/results/2026-09-29-layer-split):
     //   - every layer costs its GPU a time inversely proportional to SMs x clock (0.33 ms on an RTX 5080, 0.50 on a

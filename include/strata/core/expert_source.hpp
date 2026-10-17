@@ -903,6 +903,13 @@ private:
     uint64_t startup_blob_bytes_ = 0, startup_us_ = 0;   ///< the staged reads' counters at its begin (put back at the end)
 };
 
+/// Windows, --shared-expert-arena NAME: reserve the shared section before the rest of the start allocates
+/// (reserve_shared_early), with the size and pack hash ArenaExpertSource::open will ask for.  The expert layout must be
+/// loaded; `gguf` is what set_gguf gets, `pin_by_need` whether open will use pin by need's padded layout.  False, with
+/// the reason in `note`, when nothing was reserved (open then reserves as before).
+bool reserve_shared_arena_early(const std::string& pack_dir, const std::string& gguf, int64_t n_layers,
+                                int64_t n_expert, bool pin_by_need, const std::string& name, std::string& note);
+
 // ================================ THE RESIDENT ARENA (R2.1) ================================
 //
 // **THE MMAP ABOVE IS THE REVIEW'S FINDING C1 AND IT IS WORTH 2.2x.**  Read the comment on `FileExpertSource`
@@ -919,6 +926,7 @@ private:
 // It reads `experts.bin` into a `PinnedArena` once at startup, so the expert stream comes from anonymous memory
 // the OS has no cheaper reason to evict.  `PinnedArena` also tries `cudaHostRegister`, which the GPU needs for
 // Phase 3's cache fills and the CPU/PCIe miss split - but registration is best-effort and reported, not assumed.
+
 class ArenaExpertSource : public ExpertSource {
 public:
     ArenaExpertSource() = default;
