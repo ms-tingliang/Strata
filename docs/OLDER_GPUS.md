@@ -74,7 +74,7 @@ N`), where it runs the CUDA 13 engine.
 ```sh
 # Linux (Windows: the same with the toolkit's nvcc.exe)
 cmake -S . -B build-cuda12 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_EXPERIMENTAL_SM60=ON \
-      -DCMAKE_CUDA_ARCHITECTURES="61;70" -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
+      -DCMAKE_CUDA_ARCHITECTURES="52;61;70;75;80;86;89;90;100;120" -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
 cmake --build build-cuda12 --target strata -j
 ```
 
