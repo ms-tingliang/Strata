@@ -1090,7 +1090,7 @@ def experimental_sm60() -> bool:
 
 
 def sm60_card(arch) -> bool:
-    return 60 <= int(arch) <= 70
+    return 52 <= int(arch) <= 70
 
 
 def old_gpus_opt_in(found, named=(), cuda=None, other=False):
