@@ -6,6 +6,12 @@ rem Nothing asks a question: setup and tuning run once in this window, before th
 setlocal
 cd /d "%~dp0"
 SET STRATA_EXPERIMENTAL_SM60=1
+SET STRATA_PIN_BY_NEED=1
+SET STRATA_PCIE_MIN1=1
+SET STRATA_ARENA_PIN_GIB=0
+SET STRATA_CONVERSATION_CACHE_MIB=8192
+SET STRATA_CONVERSATION_CACHE_SLOTS=4
+SET STRATA_CONVERSATION_CACHE_MIN_FREE_MIB=2560
 set "SETUP=--cuda 12 --gpus all --family qwen --model IQ3_S --context 262144 --kv-streaming on --kv int8 --vision cpu --experimental-speed-projection off --layer-split auto --parallel 1"
 set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_ABIGAIL"
 set "PY=.venv\Scripts\python.exe"
