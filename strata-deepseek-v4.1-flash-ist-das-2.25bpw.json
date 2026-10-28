@@ -1,0 +1,48 @@
+{
+ "exe": "engine-dsv41\\strata-dsv41.exe",
+ "args": [
+  "--pack",
+  "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
+  "--max-context",
+  "8192",
+  "--eos",
+  "1",
+  "--dspark",
+  "auto",
+  "--dspark-conf",
+  "0.65",
+  "--tp",
+  "2"
+ ],
+ "cwd": "E:\\temp\\Strata",
+ "tokenizer": "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw\\tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "arch": "deepseek41",
+ "log": "E:\\temp\\Strata\\strata-deepseek-v4.1-flash-ist-das-2.25bpw.log",
+ "lib_dirs": [
+  "engine-dsv41"
+ ],
+ "port": 8080,
+ "engine_ready_s": 3600,
+ "cuda": 12,
+ "gpu": [
+  0,
+  1,
+  2
+ ],
+ "gpus_asked": true,
+ "args_written": [
+  "--pack",
+  "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
+  "--max-context",
+  "8192",
+  "--eos",
+  "1",
+  "--dspark",
+  "auto",
+  "--dspark-conf",
+  "0.65",
+  "--tp",
+  "2"
+ ]
+}
