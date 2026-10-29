@@ -26,18 +26,20 @@
   "--vision",
   "--vram-reserve-mib",
   "700",
+  "--conversation-cache-mib",
+  "8192",
+  "--conversation-cache-slots",
+  "4",
+  "--pcie-frac",
+  "0.00",
   "--spec-min-p",
-  "0.5",
+  "0.70",
   "--adapt-every",
   "1",
   "--adapt-swaps",
   "160",
   "--adapt-decay",
-  "0.97",
-  "--conversation-cache-mib",
-  "8192",
-  "--conversation-cache-slots",
-  "4"
+  "0.97"
  ],
  "cwd": "E:\\temp\\Strata",
  "tokenizer": "E:\\temp\\Strata-data\\packs\\iq3_s\\tokenizer",
@@ -66,5 +68,6 @@
   "gpu": false,
   "max_tokens": 300,
   "threads": 6
- }
+ },
+ "env": {}
 }
