@@ -6,13 +6,13 @@ cd /d "%~dp0"
 SET STRATA_EXPERIMENTAL_SM60=1
 SET STRATA_PIN_BY_NEED=1
 SET STRATA_PCIE_MIN1=1
-SET STRATA_ARENA_PIN_GIB=24
+SET STRATA_ARENA_PIN_GIB=12
 SET STRATA_CONVERSATION_CACHE_MIB=8192
 SET STRATA_CONVERSATION_CACHE_SLOTS=4
 SET STRATA_CONVERSATION_CACHE_MIN_FREE_MIB=2560
 SET STRATA_DSV41_EXE=engine-dsv41\strata-dsv41.exe
 set "SETUP=--cuda 12 --family deepseek41 --model IST-DAS-2.25bpw --gpus all --context 262144 --kv-streaming on --kv int8 --vision cpu --experimental-speed-projection off --layer-split auto --parallel 1"
-set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_ABIGAIL"
+set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_ABBY"
 
 setlocal
 set "config=strata-deepseek-v4.1-flash-ist-das-2.25bpw.json"

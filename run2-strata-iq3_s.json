@@ -58,7 +58,7 @@
  "gpus_asked": true,
  "layer_split": "auto",
  "host": "0.0.0.0",
- "api_key": "STRATA_ABIGAIL",
+ "api_key": "STRATA_ABBY",
  "parallel": 1,
  "vision": {
   "exe": "E:\\temp\\Strata\\engine-cuda12\\strata-vision.exe",
