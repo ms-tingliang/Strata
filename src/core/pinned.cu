@@ -64,6 +64,23 @@ static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 // Shared-section views: MapViewOfFile address -> the section handle, so release() unmaps and closes instead of VirtualFree.
 std::mutex g_views_mu;
 std::map<void*, HANDLE> g_views;
+
+// MEM_LARGE_PAGES and SEC_LARGE_PAGES need SeLockMemoryPrivilege.  Having it assigned to the account is not enough:
+// the PROCESS must enable it in its own token (AdjustTokenPrivileges) first, or the allocation fails.  True when it
+// is enabled; AdjustTokenPrivileges "succeeds" with ERROR_NOT_ALL_ASSIGNED for an account without the assignment.
+bool enable_lock_memory_privilege() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return false;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    bool ok = false;
+    if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        ok = AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(tok);
+    return ok;
+}
 #endif
 
 #ifndef _WIN32
@@ -144,6 +161,9 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     mapping_bytes = 0;
 
 #ifdef _WIN32
+    const SIZE_T large = GetLargePageMinimum();
+    auto try_large = large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr && enable_lock_memory_privilege();
+
     if (!shared_file.empty()) {
         // The shared arena on Windows is a named, pagefile-backed section (CreateFileMappingW) that every engine of the
         // replicas opens by name: "win:Local\\strata-replicas-<server pid>" (a name without the prefix is used as it is).
@@ -160,6 +180,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             return nullptr;
         }
         const uint64_t file_bytes = bytes + kSharedArenaHeaderBytes;
+        const SIZE_T lbytes = (SIZE_T)(((SIZE_T)file_bytes + large - 1) / large * large);
         std::string nm = shared_file.rfind("win:", 0) == 0 ? shared_file.substr(4) : shared_file;
         std::wstring wname(nm.begin(), nm.end());
         // the section is committed memory (RAM plus pagefile) from the moment it exists: say so before taking it
@@ -175,13 +196,21 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             }
             CloseHandle(probe);
         }
-        HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD) (file_bytes >> 32),
+        HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, try_large ? PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES : PAGE_READWRITE, try_large ? lbytes : (DWORD)(file_bytes >> 32),
                                       (DWORD) (file_bytes & 0xffffffffu), wname.c_str());
+        if (h == nullptr) {
+            try_large = false;
+            h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)(file_bytes >> 32), (DWORD)(file_bytes & 0xffffffffu), wname.c_str());
+        }
         if (h == nullptr) {
             note = "cannot create shared arena section " + nm + ": Windows error " + std::to_string((unsigned long long) GetLastError());
             return nullptr;
         }
-        void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 0);   // (0: the whole section, as big as it was created)
+        void* view = MapViewOfFile(h, try_large ? FILE_MAP_ALL_ACCESS | FILE_MAP_LARGE_PAGES : FILE_MAP_ALL_ACCESS, 0, 0, 0);
+        if (view == nullptr) {
+            try_large =false;
+            view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 0);   // (0: the whole section, as big as it was created)
+        }
         if (view == nullptr) {
             const DWORD e = GetLastError();
             CloseHandle(h);
@@ -238,32 +267,12 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         }
         mapping_base = view;
         mapping_bytes = file_bytes;
-        got = PageBacking::NormalPages;
+        got = try_large ? PageBacking::LargePages : PageBacking::NormalPages;
         note = "shared section " + nm + " (pack hash checked)";
         return static_cast<uint8_t*>(view) + kSharedArenaHeaderBytes;
     }
-    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege.  Having it assigned to the account is not enough: the
-    // PROCESS must enable it in its own token (AdjustTokenPrivileges) before VirtualAlloc, or the call fails.
-    // An account without the assignment, or a failure to enable, leaves the process as it was: VirtualAlloc
-    // then refuses and the 4 KB fallback below runs - that is the EXPECTED outcome on a desktop.
-    {
-        HANDLE tok = nullptr;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
-            TOKEN_PRIVILEGES tp{};
-            tp.PrivilegeCount = 1;
-            if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
-                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                if (!AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() != ERROR_NOT_ALL_ASSIGNED)
-                    (void) 0;   // nothing actionable: the large-page attempt below reports the outcome
-            }
-            CloseHandle(tok);
-        }
-    }
-    // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
-    // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
-    SIZE_T large = GetLargePageMinimum();
     // A/B switch: STRATA_NO_LARGEPAGES=1 skips the large-page attempt, same run, same boot.
-    if (large > 0 && std::getenv("STRATA_NO_LARGEPAGES") == nullptr) {
+    if (try_large) {
         // MEM_LARGE_PAGES requires the allocation size to be an exact multiple of the large page size -
         // anything else is ERROR_INVALID_PARAMETER (87), which reads like a privilege problem but is not.
         // Round up: the slack is under 2 MB and the tail stays unused.

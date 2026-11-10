@@ -1863,7 +1863,7 @@ def experimental_sm60() -> bool:
 
 
 def sm60_card(arch) -> bool:
-    return 52 <= int(arch) <= 70
+    return 60 <= int(arch) <= 70
 
 
 def maxwell_card(arch) -> bool:
