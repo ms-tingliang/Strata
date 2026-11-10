@@ -4,7 +4,7 @@
   "--pack",
   "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
   "--max-context",
-  "8192",
+  "262144",
   "--eos",
   "1",
   "--dspark",
@@ -12,7 +12,7 @@
   "--dspark-conf",
   "0.65",
   "--tp",
-  "2"
+  "3"
  ],
  "cwd": "E:\\temp\\Strata",
  "tokenizer": "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw\\tokenizer",
@@ -22,7 +22,7 @@
  "lib_dirs": [
   "engine-dsv41"
  ],
- "port": 8080,
+ "port": 8086,
  "engine_ready_s": 3600,
  "cuda": 12,
  "gpu": [
@@ -35,7 +35,7 @@
   "--pack",
   "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
   "--max-context",
-  "8192",
+  "262144",
   "--eos",
   "1",
   "--dspark",
@@ -43,6 +43,6 @@
   "--dspark-conf",
   "0.65",
   "--tp",
-  "2"
+  "3"
  ]
 }
