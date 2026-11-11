@@ -2,47 +2,49 @@
  "exe": "engine-dsv41\\strata-dsv41.exe",
  "args": [
   "--pack",
-  "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
+  "D:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
   "--max-context",
   "262144",
   "--eos",
   "1",
+  "--vision",
+  "on",
   "--dspark",
   "auto",
   "--dspark-conf",
   "0.65",
-  "--tp",
-  "3"
+  "--reserve-mib",
+  "900"
  ],
- "cwd": "E:\\temp\\Strata",
- "tokenizer": "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw\\tokenizer",
+ "cwd": "D:\\temp\\Strata",
+ "tokenizer": "D:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw\\tokenizer",
  "model_name": "deepseek-v4.1-flash",
  "arch": "deepseek41",
- "log": "E:\\temp\\Strata\\strata-deepseek-v4.1-flash-ist-das-2.25bpw.log",
+ "log": "D:\\temp\\Strata\\strata-deepseek-v4.1-flash-ist-das-2.25bpw.log",
  "lib_dirs": [
   "engine-dsv41"
  ],
  "port": 8086,
  "engine_ready_s": 3600,
  "cuda": 12,
- "gpu": [
-  0,
-  1,
-  2
- ],
+ "gpu": 0,
  "gpus_asked": true,
+ "host": "0.0.0.0",
+ "api_key": "STRATA_ALICE",
  "args_written": [
   "--pack",
-  "E:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
+  "D:\\temp\\Strata-data\\packs\\deepseek-v4.1-flash-ist-das-2.25bpw",
   "--max-context",
   "262144",
   "--eos",
   "1",
+  "--vision",
+  "on",
   "--dspark",
   "auto",
   "--dspark-conf",
   "0.65",
-  "--tp",
-  "3"
+  "--reserve-mib",
+  "900"
  ]
 }
