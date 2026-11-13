@@ -1,0 +1,1 @@
+curl -X POST http://ava:8089/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer STRATA_LITELLM" -d "{ \"model\": \"qwen3.8-flash-next-iq3_s\", \"messages\": [{\"role\":\"user\", \"content\":\"Hello!\"}] }"
