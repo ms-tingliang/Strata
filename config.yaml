@@ -1,0 +1,109 @@
+# LiteLLM proxy config for the four strata engines, with engine-load routing.
+# Deployed copy: config.yaml, run by run_litellm.bat on port 8088. testconfig.yaml
+# is the identical copy edited and reviewed against before it is copied over.
+# Routing policy, implemented in strata_router.py and measured on the live engines:
+#   1. an engine with nothing in front of a new arrival wins over one that is
+#      queueing, so a session moves to a cold idle engine instead of waiting
+#      behind another session's minutes-long prefill;
+#   2. only when every engine is already queueing do the queue depth, then the
+#      session's pinned engine, then the measured conversation-cache hit rate rank
+#      which engine to queue on;
+#   3. when a session moves, its LiteLLM session pin is rewritten to the new
+#      engine, because LiteLLM never replaces an existing pin on its own.
+model_list:
+  - model_name: qwen3.8-flash-next-iq3_s
+    model_info:
+      id: deployment-primary-1 # Required for consistent affinity pinning
+      supports_reasoning: true
+      strata_metrics_path: /metrics
+    litellm_params:
+      model: openai/qwen3.8-flash-next-iq3_s
+      api_base: http://abigail:8086/v1
+      api_key: os.environ/ABIGAIL_API_KEY
+      max_parallel_requests: 1
+      order: 1
+  - model_name: qwen3.8-flash-next-iq3_s
+    model_info:
+      id: deployment-primary-3 # Required for consistent affinity pinning
+      supports_reasoning: true
+      strata_metrics_path: /metrics
+    litellm_params:
+      model: openai/qwen3.8-flash-next-iq3_s
+      api_base: http://alice:8086/v1
+      api_key: os.environ/ALICE_API_KEY
+      max_parallel_requests: 1
+      order: 1
+  - model_name: qwen3.8-flash-next-iq3_s
+    model_info:
+      id: deployment-primary-2 # Required for consistent affinity pinning
+      supports_reasoning: true
+      strata_metrics_path: /metrics
+    litellm_params:
+      model: openai/qwen3.8-flash-next-iq3_s
+      api_base: http://abby:8086/v1
+      api_key: os.environ/ABBY_API_KEY
+      max_parallel_requests: 1
+      order: 1
+  - model_name: qwen3.8-flash-next-iq3_s
+    model_info:
+      id: deployment-secondary-1 # Required for consistent affinity pinning
+      supports_reasoning: true
+      strata_metrics_path: /metrics
+    litellm_params:
+      model: openai/qwen3.8-flash-next-iq3_s
+      api_base: http://ava:8086/v1
+      api_key: os.environ/AVA_API_KEY
+      max_parallel_requests: 1
+      order: 1
+router_settings:
+  # Only the fallback: strata_router registers a routing plugin that replaces the
+  # pick for every request. If that module ever fails to register, least-busy still
+  # routes, but it can only count what this proxy put on an endpoint - it cannot see
+  # that the other proxies have queued work on the same engines, which is how one
+  # engine piled up to 5 queued while three reported themselves idle.
+  routing_strategy: least-busy  # latency-based-routing or weight or simple-shuffle
+  # routing_strategy_args is read only by latency-based routing (litellm 1.109.1
+  # names it "just for latency-based"), so the ttl / lowest_latency_buffer pair that
+  # used to sit here changed nothing. Engine-load knobs live in strata_router.py and
+  # can be set with STRATA_METRICS_TTL_SECONDS / STRATA_METRICS_TIMEOUT_SECONDS /
+  # STRATA_METRICS_MAX_AGE_SECONDS / STRATA_PICK_VISIBLE_SECONDS / STRATA_METRICS_PATH.
+  # Pins requests with the same session ID to the deployment that served the first
+  # turn. LiteLLM keeps an existing pin forever, so on its own this check queues a
+  # session behind its pinned engine's prefill while the other engines idle; with
+  # strata_router registered, the pin is rewritten when that engine has anything
+  # queued and a free engine exists, and kept while the engine is free.
+  optional_pre_call_checks: [ "session_affinity" ]
+  deployment_affinity_ttl_seconds: 3600 # How long a session pin lasts (in seconds)
+  # Optional: Repin to a new healthy deployment if the original fails over
+  session_affinity_repin_on_failover: true
+  enable_pre_call_checks: true   # Runs token-budget deployment filtering when a request
+                                 # carries messages; the metrics strategy does not need it
+  num_retries: 2                 # Immediate single retry on another deployment
+  stream_timeout: 300
+  timeout: 600
+  retry_after: 0                 # Zero artificial backoff delay before retrying
+  allowed_fails: 3               # Quickly puts degraded endpoints into cooldown
+  cooldown_time: 600
+litellm_settings:
+  callbacks:
+    - codex_session_hook.proxy_handler_instance # thread_id -> litellm session id
+    - strata_router.proxy_handler_instance      # ranks deployments by reported engine load
+  drop_params: true
+  set_verbose: false             # Prevents heavy synchronous logging delays
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  # Optional: Enforce session tracking or auto-generate IDs for requests missing one
+  missing_session_id: "generate" # Options: "generate" | "reject" | "omit"
+  # Forward headers to downstream local servers if needed
+  forward_client_headers_to_llm_api: true
+  # proxy_server.giveup() reads this from general_settings; under router_settings it
+  # was inert. Now false, because the policy prefers a cold prefill to a queue: if a
+  # pick races another proxy into an engine's single slot, retry onto a different
+  # deployment instead of answering the client with a rate limit. The measured cost of
+  # moving is 236 s of cold prefill on the engine whose conversation cache is disabled
+  # versus 6 s on one that had the prompt already parked, against minutes of queueing
+  # that blocks every later turn of the session behind it.
+  disable_retry_on_max_parallel_request_limit_error: false
+  # Per-worker admission control, also a general_settings value. Only takes effect
+  # when max_in_flight_requests_per_worker is set as well.
+  admission_queue_timeout_seconds: 1.0 # Max seconds a request waits for a worker slot before 503

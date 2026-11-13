@@ -21,8 +21,8 @@ SET STRATA_CONVERSATION_CACHE_MIB=8192
 SET STRATA_CONVERSATION_CACHE_SLOTS=6
 SET STRATA_CONVERSATION_CACHE_MIN_FREE_MIB=2560
 SET STRATA_DSV41_EXE=engine-dsv41\strata-dsv41.exe
-set "SETUP=--cuda 12 --family deepseek41 --model IST-DAS-2.25bpw --gpu 0 --context 262144 --kv-streaming on --kv int8 --vision cpu --experimental-speed-projection off --layer-split auto --parallel 1"
-set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_ALICE"
+set "SETUP=--family deepseek41 --model IST-DAS-2.25bpw --gpu 0 --context 262144 --kv-streaming on --kv int8 --vision cpu --experimental-speed-projection off --layer-split auto --parallel 1"
+set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_AVA"
 
 setlocal
 set "PY=.venv\Scripts\python.exe"

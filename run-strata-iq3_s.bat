@@ -23,8 +23,8 @@ SET STRATA_CONVERSATION_CACHE_SLOTS=6
 SET STRATA_CONVERSATION_CACHE_MIN_FREE_MIB=2560
 
 setlocal
-set "SETUP=--cuda 12 --gpu 0 --family qwen --model IQ3_S --context 262144 --kv-streaming on --kv int8 --vision cpu --experimental-speed-projection off --layer-split auto --parallel 1"
-set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_ALICE"
+set "SETUP=--gpu 0 --family qwen --model IQ3_S --context 262144 --kv-streaming on --kv int8 --vision cpu --experimental-speed-projection off --layer-split auto --parallel 1"
+set "SERVE=--host 0.0.0.0 --port 8086 --api-key STRATA_AVA"
 set "PY=.venv\Scripts\python.exe"
 set "NEW="
 if /i "%~1"=="--setup" (set "NEW=1" & shift)
